@@ -1,9 +1,8 @@
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { 
   TrendingDown, 
   Calendar, 
-  DollarSign, 
   ChevronDown, 
   ChevronRight, 
   Settings2,
@@ -13,13 +12,47 @@ import {
   ListFilter,
   ShieldCheck,
   CreditCard,
-  Wallet,
   Download,
-  Upload
+  Upload,
+  Cloud,
+  CloudOff,
+  RefreshCw
 } from 'lucide-react';
+
+// Firebase Modular SDK (v9+)
+import { initializeApp, getApps } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, User } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot } from 'firebase/firestore';
+
 import { Debt, LumpSum, BudgetChange } from './types';
 import { INITIAL_DEBTS, DEFAULT_LUMP_SUM, DEFAULT_MONTHLY_BUDGET } from './constants';
 import { runSimulation } from './services/calculationEngine';
+
+// Firebase Configuration using process.env for Vercel compatibility
+const firebaseConfig = {
+  apiKey: process.env.FIREBASE_API_KEY,
+  authDomain: process.env.FIREBASE_AUTH_DOMAIN,
+  projectId: process.env.FIREBASE_PROJECT_ID,
+  storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.FIREBASE_APP_ID,
+  measurementId: process.env.FIREBASE_MEASUREMENT_ID
+};
+
+// Singleton instances
+let db: any = null;
+let auth: any = null;
+
+// Initialize Firebase only if the API Key is present in the environment
+if (firebaseConfig.apiKey && getApps().length === 0) {
+  try {
+    const app = initializeApp(firebaseConfig);
+    db = getFirestore(app);
+    auth = getAuth(app);
+  } catch (err) {
+    console.error("Firebase Initialization Error:", err);
+  }
+}
 
 export default function App() {
   const [debts, setDebts] = useState<Debt[]>(INITIAL_DEBTS);
@@ -30,7 +63,79 @@ export default function App() {
   const [monthlyBudget, setMonthlyBudget] = useState(DEFAULT_MONTHLY_BUDGET);
   const [budgetChanges, setBudgetChanges] = useState<BudgetChange[]>([]);
   const [expandedMonths, setExpandedMonths] = useState<Set<number>>(new Set());
+  
+  // Firebase Sync State
+  const [user, setUser] = useState<User | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [cloudStatus, setCloudStatus] = useState<'disabled' | 'connecting' | 'active' | 'error'>(
+    db ? 'connecting' : 'disabled'
+  );
 
+  // --- FIREBASE: AUTH & INITIAL LOAD ---
+  useEffect(() => {
+    if (!auth || !db) return;
+
+    const unsubscribeAuth = onAuthStateChanged(auth, (u) => {
+      if (u) {
+        setUser(u);
+        setCloudStatus('active');
+        
+        // Listen for real-time updates from Firestore for this user
+        const docRef = doc(db, 'userSimulations', u.uid);
+        const unsubscribeDoc = onSnapshot(docRef, (docSnap) => {
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            // Only update local state if remote data exists
+            if (data.debts) setDebts(data.debts);
+            if (data.startDate) setStartDate(data.startDate);
+            if (data.injections) setInjections(data.injections);
+            if (data.monthlyBudget) setMonthlyBudget(data.monthlyBudget);
+            if (data.budgetChanges) setBudgetChanges(data.budgetChanges);
+          }
+        }, (err) => {
+          console.error("Firestore Listen Error:", err);
+          setCloudStatus('error');
+        });
+
+        return () => unsubscribeDoc();
+      } else {
+        // Sign in anonymously if not logged in
+        signInAnonymously(auth).catch((err) => {
+          console.error("Anonymous Sign-In Error:", err);
+          setCloudStatus('error');
+        });
+      }
+    });
+
+    return () => unsubscribeAuth();
+  }, []);
+
+  // --- FIREBASE: DATA PERSISTENCE (SAVE) ---
+  useEffect(() => {
+    if (!user || !db) return;
+
+    const saveTimeout = setTimeout(async () => {
+      setIsSyncing(true);
+      try {
+        await setDoc(doc(db, 'userSimulations', user.uid), {
+          debts,
+          startDate,
+          injections,
+          monthlyBudget,
+          budgetChanges,
+          lastModified: new Date().toISOString()
+        }, { merge: true });
+      } catch (err) {
+        console.error("Firestore Save Error:", err);
+      } finally {
+        setIsSyncing(false);
+      }
+    }, 1000); // 1-second debounce to prevent spamming Firestore
+
+    return () => clearTimeout(saveTimeout);
+  }, [debts, startDate, injections, monthlyBudget, budgetChanges, user]);
+
+  // --- ENGINE CALCULATIONS ---
   const results = useMemo(() => {
     const standard = runSimulation(debts, injections, monthlyBudget, budgetChanges, startDate, false);
     const minimum = runSimulation(debts, [], monthlyBudget, budgetChanges, startDate, true);
@@ -41,6 +146,7 @@ export default function App() {
     return debts.reduce((sum, d) => sum + Math.max(d.minPaymentFlat, d.balance * (d.minPaymentPercent / 100)), 0);
   }, [debts]);
 
+  // --- UI FORMATTERS ---
   const formatCurrency = (val: number) => 
     new Intl.NumberFormat('en-US', { 
       style: 'currency', 
@@ -65,6 +171,7 @@ export default function App() {
     setDebts(prev => prev.map(d => d.id === id ? { ...d, [field]: value } : d));
   };
 
+  // --- ACTION HANDLERS ---
   const addInjection = () => {
     setInjections(prev => [...prev, { 
       id: Math.random().toString(36).substr(2, 9), 
@@ -103,18 +210,18 @@ export default function App() {
     return (target.getFullYear() - now.getFullYear()) * 12 + (target.getMonth() - now.getMonth());
   };
 
-  const handleSave = () => {
+  const handleExport = () => {
     const config = { debts, startDate, injections, monthlyBudget, budgetChanges };
     const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `waterfall-config-${new Date().toISOString().split('T')[0]}.json`;
+    a.download = `waterfall-export-${new Date().toISOString().split('T')[0]}.json`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
-  const handleLoad = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImport = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
@@ -127,60 +234,66 @@ export default function App() {
         if (data.monthlyBudget) setMonthlyBudget(data.monthlyBudget);
         if (data.budgetChanges) setBudgetChanges(data.budgetChanges);
       } catch (err) {
-        alert("Failed to load JSON file. Please ensure it is a valid simulation export.");
+        alert("Invalid file format.");
       }
     };
     reader.readAsText(file);
-    e.target.value = ''; // Reset input
+    e.target.value = '';
   };
 
   return (
     <div className="min-h-screen bg-[#020617] text-slate-100 p-4 md:p-8 font-sans selection:bg-emerald-500/30">
       <header className="max-w-7xl mx-auto mb-10 flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
         <div>
-          <h1 className="text-4xl font-black tracking-tight bg-gradient-to-r from-emerald-400 to-cyan-500 bg-clip-text text-transparent">
-            DEBT WATERFALL SIMULATOR
+          <h1 className="text-4xl font-black tracking-tight bg-gradient-to-r from-emerald-400 to-cyan-500 bg-clip-text text-transparent uppercase">
+            Debt Waterfall Simulator
           </h1>
-          <p className="text-slate-400 mt-2 font-medium tracking-wide">CREDIT-FIRST AVALANCHE PROTECTION SYSTEM</p>
+          <div className="flex items-center gap-4 mt-2">
+            <p className="text-slate-400 font-medium tracking-wide uppercase text-xs">High-Fidelity Avalanche Calculation Engine</p>
+            {cloudStatus === 'active' ? (
+              <div className="flex items-center gap-2 bg-emerald-500/10 border border-emerald-500/20 px-3 py-1 rounded-full text-[10px] font-black text-emerald-400">
+                <Cloud className={`w-3 h-3 ${isSyncing ? 'animate-pulse' : ''}`} /> 
+                {isSyncing ? 'SYNCING DATA...' : 'CLOUD SYNC ACTIVE'}
+              </div>
+            ) : cloudStatus === 'connecting' ? (
+              <div className="flex items-center gap-2 bg-cyan-500/10 border border-cyan-500/20 px-3 py-1 rounded-full text-[10px] font-black text-cyan-400">
+                <RefreshCw className="w-3 h-3 animate-spin" /> CONNECTING...
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 bg-slate-800 border border-slate-700 px-3 py-1 rounded-full text-[10px] font-black text-slate-500">
+                <CloudOff className="w-3 h-3" /> LOCAL MODE
+              </div>
+            )}
+          </div>
         </div>
         
         <div className="flex flex-wrap items-center gap-4">
-          <div className="flex items-center gap-2">
-            <button 
-              onClick={handleSave}
-              className="flex items-center gap-2 bg-slate-900 border border-slate-700 hover:border-cyan-500/50 hover:bg-slate-800 text-slate-100 px-6 py-3 rounded-2xl transition-all font-black text-sm shadow-xl group"
-            >
-              <Download className="w-4 h-4 text-cyan-400 group-hover:scale-110 transition-transform" /> SAVE DATA
-            </button>
-            <label className="flex items-center gap-2 bg-emerald-500/10 border border-emerald-500/20 hover:bg-emerald-500/20 hover:border-emerald-500/40 text-emerald-400 px-6 py-3 rounded-2xl transition-all font-black text-sm shadow-xl cursor-pointer group">
-              <Upload className="w-4 h-4 group-hover:scale-110 transition-transform" /> LOAD DATA
-              <input type="file" accept=".json" onChange={handleLoad} className="hidden" />
-            </label>
-          </div>
-
-          <div className="flex items-center gap-3 bg-slate-900/80 border border-slate-800 px-5 py-3 rounded-2xl shadow-lg">
-            <ShieldCheck className="w-4 h-4 text-emerald-400" />
-            <span className="text-sm font-semibold text-slate-300">
-              Strategy: <span className="text-emerald-400 uppercase tracking-widest">Mandatory Min Protected</span>
-            </span>
-          </div>
+          <button 
+            onClick={handleExport}
+            className="flex items-center gap-2 bg-slate-900 border border-slate-700 hover:border-cyan-500/50 hover:bg-slate-800 text-slate-100 px-6 py-3 rounded-2xl transition-all font-black text-sm shadow-xl group"
+          >
+            <Download className="w-4 h-4 text-cyan-400 group-hover:scale-110 transition-transform" /> EXPORT JSON
+          </button>
+          <label className="flex items-center gap-2 bg-emerald-500/10 border border-emerald-500/20 hover:bg-emerald-500/20 hover:border-emerald-500/40 text-emerald-400 px-6 py-3 rounded-2xl transition-all font-black text-sm shadow-xl cursor-pointer group">
+            <Upload className="w-4 h-4 group-hover:scale-110 transition-transform" /> IMPORT JSON
+            <input type="file" accept=".json" onChange={handleImport} className="hidden" />
+          </label>
         </div>
       </header>
 
       <main className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-        {/* Left Panel: Inputs */}
+        {/* LEFT PANEL: INPUTS */}
         <div className="lg:col-span-4 space-y-6">
           <section className="bg-slate-900/50 border border-slate-800 rounded-3xl p-8 shadow-2xl backdrop-blur-sm">
             <div className="flex justify-between items-center mb-6">
               <h2 className="text-xl font-bold flex items-center gap-3">
-                <Settings2 className="w-5 h-5 text-emerald-500" />
-                Global Controls
+                <Settings2 className="w-5 h-5 text-emerald-500" /> Global Controls
               </h2>
             </div>
             
             <div className="space-y-6">
               <div className="group">
-                <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2 transition-colors group-focus-within:text-emerald-400">Simulation Start Date</label>
+                <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2 group-focus-within:text-emerald-400 transition-colors">Payoff Start Date</label>
                 <div className="relative">
                   <Calendar className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 w-4 h-4" />
                   <input 
@@ -193,7 +306,7 @@ export default function App() {
               </div>
 
               <div className="group">
-                <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2 transition-colors group-focus-within:text-emerald-400">Initial Monthly Budget</label>
+                <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2 group-focus-within:text-emerald-400 transition-colors">Monthly Budget</label>
                 <div className="relative">
                   <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 font-bold">$</span>
                   <input 
@@ -207,7 +320,7 @@ export default function App() {
 
               <div className="pt-4 border-t border-slate-800">
                 <div className="flex justify-between items-center mb-4">
-                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Budget Schedule</label>
+                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Budget Adjustments</label>
                    <button onClick={addBudgetChange} className="p-1.5 bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500 hover:text-white rounded-xl transition-all border border-cyan-500/20"><Plus className="w-4 h-4" /></button>
                 </div>
                 <div className="space-y-3">
@@ -229,7 +342,7 @@ export default function App() {
 
               <div className="pt-4 border-t border-slate-800">
                 <div className="flex justify-between items-center mb-4">
-                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Injection Schedule</label>
+                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Lump Sum Injections</label>
                    <button onClick={addInjection} className="p-1.5 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500 hover:text-white rounded-xl transition-all border border-emerald-500/20"><Plus className="w-4 h-4" /></button>
                 </div>
                 <div className="space-y-3">
@@ -254,7 +367,7 @@ export default function App() {
           <section className="bg-slate-900/50 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl backdrop-blur-sm">
             <div className="p-6 bg-slate-900/80 border-b border-slate-800 flex justify-between items-center">
               <h2 className="text-xl font-bold flex items-center gap-2">
-                <CreditCard className="w-5 h-5 text-emerald-500" /> Card Inventory
+                <CreditCard className="w-5 h-5 text-emerald-500" /> Debt Inventory
               </h2>
             </div>
             <div className="p-4 max-h-[600px] overflow-y-auto custom-scrollbar">
@@ -303,34 +416,32 @@ export default function App() {
           </section>
         </div>
 
-        {/* Right Panel: Dashboard & Ledger */}
+        {/* RIGHT PANEL: DASHBOARD & LEDGER */}
         <div className="lg:col-span-8 space-y-8">
-          
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl shadow-xl relative overflow-hidden">
-              <TrendingDown className="absolute -top-4 -right-4 w-16 h-16 text-rose-500 opacity-[0.03] rotate-12" />
-              <p className="text-[9px] text-slate-500 uppercase font-black tracking-widest">Total Interest</p>
+            <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl shadow-xl relative overflow-hidden group">
+              <div className="absolute inset-0 bg-rose-500/5 opacity-0 group-hover:opacity-100 transition-opacity" />
+              <p className="text-[9px] text-slate-500 uppercase font-black tracking-widest">Total Interest Paid</p>
               <h3 className="text-2xl font-black text-rose-500 mt-1">{formatCurrency(results.standard.totalInterestPaid)}</h3>
             </div>
             
-            <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl shadow-xl relative overflow-hidden">
-              <Calendar className="absolute -top-4 -right-4 w-16 h-16 text-cyan-500 opacity-[0.03] rotate-12" />
-              <p className="text-[9px] text-slate-500 uppercase font-black tracking-widest">Months to Zero</p>
-              <h3 className="text-2xl font-black text-cyan-400 mt-1">{results.standard.monthsToDebtFree}m</h3>
+            <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl shadow-xl relative overflow-hidden group">
+              <div className="absolute inset-0 bg-cyan-500/5 opacity-0 group-hover:opacity-100 transition-opacity" />
+              <p className="text-[9px] text-slate-500 uppercase font-black tracking-widest">Months to Freedom</p>
+              <h3 className="text-2xl font-black text-cyan-400 mt-1">{results.standard.monthsToDebtFree} Months</h3>
             </div>
 
-            <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl shadow-xl relative overflow-hidden">
-              <ShieldCheck className="absolute -top-4 -right-4 w-16 h-16 text-emerald-500 opacity-[0.03] rotate-12" />
+            <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl shadow-xl relative overflow-hidden group">
+              <div className="absolute inset-0 bg-emerald-500/5 opacity-0 group-hover:opacity-100 transition-opacity" />
               <p className="text-[9px] text-slate-500 uppercase font-black tracking-widest">Initial Monthly Min</p>
               <h3 className="text-2xl font-black text-emerald-400 mt-1">{formatCurrency(totalMinimums)}</h3>
             </div>
           </div>
 
           <section className="bg-slate-900/50 border border-slate-800 rounded-3xl overflow-hidden shadow-2xl backdrop-blur-md">
-            <div className="p-8 border-b border-slate-800 flex justify-between items-center bg-slate-900/80">
-              <h2 className="text-2xl font-black flex items-center gap-3">
-                <ListFilter className="w-6 h-6 text-emerald-400" />
-                Monthly Payoff Ledger
+            <div className="p-8 border-b border-slate-800 bg-slate-900/80">
+              <h2 className="text-2xl font-black flex items-center gap-3 uppercase tracking-tight">
+                <ListFilter className="w-6 h-6 text-emerald-400" /> Simulation Ledger
               </h2>
             </div>
 
@@ -348,7 +459,7 @@ export default function App() {
                         <div>
                           <div className="flex items-center gap-3">
                              <span className="text-2xl font-black">{formatCurrency(entry.remainingTotalBalance)}</span>
-                             {hasInj && <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 text-[8px] font-black uppercase tracking-widest border border-emerald-500/30">Lump Sum Applied</span>}
+                             {hasInj && <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 text-[8px] font-black uppercase tracking-widest border border-emerald-500/30">Injection Applied</span>}
                           </div>
                           <div className="text-[10px] flex gap-4 mt-1 font-bold">
                             <span className="text-emerald-400/80 flex items-center gap-1.5 uppercase tracking-wide"><MoveUpRight className="w-3 h-3" /> Principal: {formatCurrency(entry.totalPrincipal)}</span>
@@ -363,15 +474,14 @@ export default function App() {
                       <div className="px-12 pb-8 pt-2 animate-in slide-in-from-top-4 duration-300">
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-8 bg-slate-950/50 p-6 rounded-[2rem] border border-slate-800">
                           <div className="space-y-4">
-                            <p className="text-[10px] uppercase font-black text-slate-500 tracking-widest">Monthly Transactions</p>
+                            <p className="text-[10px] uppercase font-black text-slate-500 tracking-widest">Transactions</p>
                             <div className="space-y-2 max-h-80 overflow-y-auto pr-2 custom-scrollbar">
                               <table className="w-full text-left text-[11px]">
                                 <thead>
                                   <tr className="text-slate-600 border-b border-slate-900">
-                                    <th className="pb-2">Card</th>
+                                    <th className="pb-2">Debt</th>
                                     <th className="pb-2 text-right">Int</th>
                                     <th className="pb-2 text-right">Prin</th>
-                                    <th className="pb-2 text-right">Paid</th>
                                   </tr>
                                 </thead>
                                 <tbody>
@@ -379,15 +489,13 @@ export default function App() {
                                     <tr key={idx} className="border-b border-slate-900/50">
                                       <td className="py-2 font-bold text-slate-400">{p.debtName}</td>
                                       <td className="py-2 text-right text-rose-500/70 font-mono">{formatCurrency(p.interest)}</td>
-                                      <td className="py-2 text-right text-emerald-500/70 font-mono">{formatCurrency(p.principal)}</td>
-                                      <td className="py-2 text-right text-emerald-400 font-black font-mono">{formatCurrency(p.total)}</td>
+                                      <td className="py-2 text-right text-emerald-400 font-black font-mono">{formatCurrency(p.principal)}</td>
                                     </tr>
                                   ))}
                                   <tr className="font-black">
-                                     <td className="py-3 text-slate-300">TOTAL</td>
+                                     <td className="py-3 text-slate-300">MONTHLY TOTAL</td>
                                      <td className="py-3 text-right text-rose-500">{formatCurrency(entry.totalInterest)}</td>
-                                     <td className="py-3 text-right text-emerald-500">{formatCurrency(entry.totalPrincipal)}</td>
-                                     <td className="py-3 text-right text-emerald-400 underline decoration-2 underline-offset-4">{formatCurrency(entry.totalInterest + entry.totalPrincipal)}</td>
+                                     <td className="py-3 text-right text-emerald-400">{formatCurrency(entry.totalPrincipal)}</td>
                                   </tr>
                                 </tbody>
                               </table>
@@ -395,7 +503,7 @@ export default function App() {
                           </div>
 
                           <div className="space-y-4">
-                             <p className="text-[10px] uppercase font-black text-slate-500 tracking-widest">Closing Balances</p>
+                             <p className="text-[10px] uppercase font-black text-slate-500 tracking-widest">Remaining Balances</p>
                              <div className="space-y-2">
                                {Object.entries(entry.balances).map(([name, bal], idx) => {
                                  const balanceValue = bal as number;
@@ -403,7 +511,7 @@ export default function App() {
                                    <div key={idx} className="flex justify-between items-center text-xs">
                                      <span className="font-semibold text-slate-400">{name}</span>
                                      <span className={`font-mono font-black ${balanceValue <= 0 ? 'text-emerald-500 text-[10px] uppercase tracking-widest bg-emerald-500/10 px-2 py-0.5 rounded' : 'text-slate-300'}`}>
-                                        {balanceValue <= 0 ? 'PAID OFF' : formatCurrency(balanceValue)}
+                                        {balanceValue <= 0 ? 'PAID' : formatCurrency(balanceValue)}
                                      </span>
                                    </div>
                                  );
@@ -422,7 +530,7 @@ export default function App() {
       </main>
       
       <footer className="max-w-7xl mx-auto mt-20 pt-10 border-t border-slate-900 text-center text-slate-600 text-[9px] font-black uppercase tracking-[0.5em]">
-        High-Fidelity Amortization Engine • Credit-Safe Protocol
+        High-Fidelity Amortization Engine • Zero-Knowledge Firebase Architecture
       </footer>
     </div>
   );
