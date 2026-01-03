@@ -84,6 +84,7 @@ export default function App() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [authError, setAuthError] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   // --- FIREBASE: AUTH LISTENER ---
   useEffect(() => {
@@ -142,8 +143,16 @@ export default function App() {
   // --- AUTH HANDLERS ---
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
+    
+    setIsSubmitting(true);
     setAuthError('');
-    if (!auth) return;
+    
+    if (!auth) {
+      setAuthError('Authentication module failed to initialize. Check environment variables.');
+      setIsSubmitting(false);
+      return;
+    }
 
     try {
       if (isLoginView) {
@@ -155,7 +164,10 @@ export default function App() {
       setEmail('');
       setPassword('');
     } catch (err: any) {
+      console.error("Auth Exception:", err);
       setAuthError(err.message.replace('Firebase: ', ''));
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -268,6 +280,7 @@ export default function App() {
                     placeholder="name@example.com"
                     className="w-full bg-slate-800/50 border border-slate-700 rounded-2xl py-4 pl-12 pr-4 text-sm focus:border-emerald-500 outline-none transition-all"
                     required
+                    disabled={isSubmitting}
                   />
                 </div>
               </div>
@@ -283,27 +296,38 @@ export default function App() {
                     placeholder="••••••••"
                     className="w-full bg-slate-800/50 border border-slate-700 rounded-2xl py-4 pl-12 pr-4 text-sm focus:border-emerald-500 outline-none transition-all"
                     required
+                    disabled={isSubmitting}
                   />
                 </div>
               </div>
 
-              {authError && <p className="text-rose-500 text-[10px] font-bold uppercase text-center">{authError}</p>}
+              {authError && <p className="text-rose-500 text-[10px] font-bold uppercase text-center animate-pulse">{authError}</p>}
 
-              <button type="submit" className="w-full bg-emerald-500 hover:bg-emerald-400 text-emerald-950 font-black py-4 rounded-2xl transition-all shadow-lg shadow-emerald-500/20 uppercase tracking-widest">
-                {isLoginView ? 'Sign In' : 'Create Account'}
+              <button 
+                type="submit" 
+                disabled={isSubmitting}
+                className="w-full bg-emerald-500 hover:bg-emerald-400 disabled:bg-slate-700 disabled:text-slate-500 text-emerald-950 font-black py-4 rounded-2xl transition-all shadow-lg shadow-emerald-500/20 uppercase tracking-widest flex items-center justify-center gap-2"
+              >
+                {isSubmitting ? (
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                ) : (
+                  isLoginView ? 'Sign In' : 'Create Account'
+                )}
               </button>
             </form>
 
             <button 
               onClick={() => setIsLoginView(!isLoginView)}
-              className="w-full mt-6 text-[10px] font-black uppercase text-slate-500 hover:text-emerald-400 tracking-widest transition-colors"
+              disabled={isSubmitting}
+              className="w-full mt-6 text-[10px] font-black uppercase text-slate-500 hover:text-emerald-400 tracking-widest transition-colors disabled:opacity-50"
             >
               {isLoginView ? "Don't have an account? Sign Up" : "Already have an account? Sign In"}
             </button>
             
             <button 
               onClick={() => setShowAuthModal(false)}
-              className="absolute top-6 right-6 text-slate-600 hover:text-slate-300 transition-colors"
+              disabled={isSubmitting}
+              className="absolute top-6 right-6 text-slate-600 hover:text-slate-300 transition-colors disabled:opacity-50"
             >
               <Trash2 className="w-5 h-5" />
             </button>
@@ -416,7 +440,7 @@ export default function App() {
               <div className="pt-4 border-t border-slate-800">
                 <div className="flex justify-between items-center mb-4">
                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest px-2">Lump Injections</label>
-                   <button onClick={addInjection} className="p-1.5 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500 hover:text-white rounded-xl transition-all border border-emerald-500/20"><Plus className="w-4 h-4" /></button>
+                   <button onClick={addInjection} className="p-1.5 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500 hover:text-white rounded-xl transition-all border border-cyan-500/20"><Plus className="w-4 h-4" /></button>
                 </div>
                 <div className="space-y-3">
                   {injections.map((inj) => (
