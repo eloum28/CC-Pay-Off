@@ -1,0 +1,5 @@
+{
+  "name": "Debt Waterfall & Interest Simulator",
+  "description": "A high-fidelity financial tool to simulate debt payoff using the Avalanche (highest APR first) method with lump sum injections and monthly budget waterfalls.",
+  "requestFramePermissions": []
+}
