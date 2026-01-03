@@ -1,69 +1,84 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { 
   TrendingDown, 
   Calendar, 
   ChevronDown, 
   ChevronRight, 
-  Settings2,
-  MoveUpRight,
-  Plus,
-  Trash2,
-  ListFilter,
-  ShieldCheck,
-  CreditCard,
-  Download,
-  Upload,
-  Cloud,
-  CloudOff,
-  RefreshCw,
-  LogIn,
-  LogOut,
-  UserPlus,
-  Mail,
-  Lock,
-  Loader2
+  Settings2, 
+  MoveUpRight, 
+  Plus, 
+  Trash2, 
+  ListFilter, 
+  ShieldCheck, 
+  CreditCard, 
+  Download, 
+  Upload, 
+  Cloud, 
+  CloudOff, 
+  RefreshCw, 
+  LogIn, 
+  LogOut, 
+  UserPlus, 
+  Mail, 
+  Lock, 
+  Loader2 
 } from 'lucide-react';
 
-// Firebase Modular SDK (v9+)
-import { initializeApp, getApps } from 'firebase/app';
+// Firebase Modular SDK (v10+)
+import { initializeApp, getApps, getApp, FirebaseApp } from 'firebase/app';
 import { 
   getAuth, 
   onAuthStateChanged, 
   User, 
   signInWithEmailAndPassword, 
   createUserWithEmailAndPassword, 
-  signOut 
+  signOut,
+  Auth
 } from 'firebase/auth';
-import { getFirestore, doc, setDoc, onSnapshot, getDoc } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, onSnapshot, getDoc, Firestore } from 'firebase/firestore';
 
 import { Debt, LumpSum, BudgetChange } from './types';
 import { INITIAL_DEBTS, DEFAULT_LUMP_SUM, DEFAULT_MONTHLY_BUDGET } from './constants';
 import { runSimulation } from './services/calculationEngine';
 
-// Firebase Configuration
-const firebaseConfig = {
-  apiKey: process.env.FIREBASE_API_KEY,
-  authDomain: process.env.FIREBASE_AUTH_DOMAIN,
-  projectId: process.env.FIREBASE_PROJECT_ID,
-  storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.FIREBASE_APP_ID,
-  measurementId: process.env.FIREBASE_MEASUREMENT_ID
+// Safe environment variable access
+const getEnv = (key: string): string | undefined => {
+  try {
+    if (typeof process !== 'undefined' && process.env && process.env[key]) return process.env[key];
+    if (typeof window !== 'undefined' && (window as any)[key]) return (window as any)[key];
+  } catch (e) {}
+  return undefined;
 };
 
-// Singleton instances
-let db: any = null;
-let auth: any = null;
+// Firebase Configuration
+const firebaseConfig = {
+  apiKey: getEnv('FIREBASE_API_KEY'),
+  authDomain: getEnv('FIREBASE_AUTH_DOMAIN'),
+  projectId: getEnv('FIREBASE_PROJECT_ID'),
+  storageBucket: getEnv('FIREBASE_STORAGE_BUCKET'),
+  messagingSenderId: getEnv('FIREBASE_MESSAGING_SENDER_ID'),
+  appId: getEnv('FIREBASE_APP_ID'),
+  measurementId: getEnv('FIREBASE_MEASUREMENT_ID')
+};
 
-if (firebaseConfig.apiKey && getApps().length === 0) {
+// Global state for Firebase instances
+let db: Firestore | null = null;
+let auth: Auth | null = null;
+
+// Initialization logic with graceful mock fallback
+const initFirebase = () => {
+  if (auth && db) return { auth, db, isMock: false };
+  if (!firebaseConfig.apiKey) return { auth: null, db: null, isMock: true };
+
   try {
-    const app = initializeApp(firebaseConfig);
+    const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
     db = getFirestore(app);
     auth = getAuth(app);
+    return { auth, db, isMock: false };
   } catch (err) {
-    console.error("Firebase Initialization Error:", err);
+    return { auth: null, db: null, isMock: true };
   }
-}
+};
 
 export default function App() {
   const [debts, setDebts] = useState<Debt[]>(INITIAL_DEBTS);
@@ -85,60 +100,76 @@ export default function App() {
   const [password, setPassword] = useState('');
   const [authError, setAuthError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isMockMode, setIsMockMode] = useState(false);
 
-  // --- FIREBASE: AUTH LISTENER ---
+  // --- PERSISTENCE: LOAD DATA ---
   useEffect(() => {
-    if (!auth) {
+    const { auth: currentAuth, db: currentDb, isMock } = initFirebase();
+    setIsMockMode(isMock);
+    
+    if (isMock) {
+      const savedUser = localStorage.getItem('debt_sim_mock_user');
+      if (savedUser) {
+        const u = JSON.parse(savedUser);
+        setUser(u);
+        const savedData = localStorage.getItem(`debt_sim_data_${u.uid}`);
+        if (savedData) {
+          const d = JSON.parse(savedData);
+          setDebts(d.debts || INITIAL_DEBTS);
+          setStartDate(d.startDate || startDate);
+          setInjections(d.injections || injections);
+          setMonthlyBudget(d.monthlyBudget || monthlyBudget);
+          setBudgetChanges(d.budgetChanges || budgetChanges);
+        }
+      }
       setAuthLoading(false);
       return;
     }
 
-    const unsubscribe = onAuthStateChanged(auth, async (u) => {
+    const unsubscribe = onAuthStateChanged(currentAuth!, async (u) => {
       setUser(u);
       setAuthLoading(false);
-      if (u && db) {
-        // Load user data once on login
-        const docRef = doc(db, 'users', u.uid);
-        const docSnap = await getDoc(docRef);
-        if (docSnap.exists()) {
-          const data = docSnap.data();
-          if (data.debts) setDebts(data.debts);
-          if (data.startDate) setStartDate(data.startDate);
-          if (data.injections) setInjections(data.injections);
-          if (data.monthlyBudget) setMonthlyBudget(data.monthlyBudget);
-          if (data.budgetChanges) setBudgetChanges(data.budgetChanges);
-        }
+      if (u && currentDb) {
+        try {
+          const docSnap = await getDoc(doc(currentDb, 'users', u.uid));
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            if (data.debts) setDebts(data.debts);
+            if (data.startDate) setStartDate(data.startDate);
+            if (data.injections) setInjections(data.injections);
+            if (data.monthlyBudget) setMonthlyBudget(data.monthlyBudget);
+            if (data.budgetChanges) setBudgetChanges(data.budgetChanges);
+          }
+        } catch (e) {}
       }
     });
-
     return () => unsubscribe();
   }, []);
 
-  // --- FIREBASE: DATA PERSISTENCE (SAVE TO 'users' COLLECTION) ---
+  // --- PERSISTENCE: SAVE DATA ---
   useEffect(() => {
-    if (!user || !db) return;
+    if (!user) return;
 
     const saveTimeout = setTimeout(async () => {
       setIsSyncing(true);
-      try {
-        await setDoc(doc(db, 'users', user.uid), {
-          debts,
-          startDate,
-          injections,
-          monthlyBudget,
-          budgetChanges,
-          email: user.email,
-          lastModified: new Date().toISOString()
-        }, { merge: true });
-      } catch (err) {
-        console.error("Firestore Sync Error:", err);
-      } finally {
-        setIsSyncing(false);
+      const dataToSave = {
+        debts, startDate, injections, monthlyBudget, budgetChanges,
+        email: user.email,
+        lastModified: new Date().toISOString()
+      };
+
+      if (isMockMode) {
+        localStorage.setItem(`debt_sim_data_${user.uid}`, JSON.stringify(dataToSave));
+        setTimeout(() => setIsSyncing(false), 500);
+      } else if (db) {
+        try {
+          await setDoc(doc(db, 'users', user.uid), dataToSave, { merge: true });
+        } catch (e) {} finally { setIsSyncing(false); }
       }
-    }, 1500);
+    }, 1000);
 
     return () => clearTimeout(saveTimeout);
-  }, [debts, startDate, injections, monthlyBudget, budgetChanges, user]);
+  }, [debts, startDate, injections, monthlyBudget, budgetChanges, user, isMockMode]);
 
   // --- AUTH HANDLERS ---
   const handleAuth = async (e: React.FormEvent) => {
@@ -148,31 +179,41 @@ export default function App() {
     setIsSubmitting(true);
     setAuthError('');
     
-    if (!auth) {
-      setAuthError('Authentication module failed to initialize. Check environment variables.');
+    const { auth: currentAuth, isMock } = initFirebase();
+
+    // Simulation delay for feel
+    await new Promise(r => setTimeout(r, 800));
+
+    if (isMock) {
+      const mockUser = { uid: 'mock-' + email.split('@')[0], email } as User;
+      setUser(mockUser);
+      localStorage.setItem('debt_sim_mock_user', JSON.stringify(mockUser));
+      setShowAuthModal(false);
       setIsSubmitting(false);
       return;
     }
 
     try {
       if (isLoginView) {
-        await signInWithEmailAndPassword(auth, email, password);
+        await signInWithEmailAndPassword(currentAuth!, email, password);
       } else {
-        await createUserWithEmailAndPassword(auth, email, password);
+        await createUserWithEmailAndPassword(currentAuth!, email, password);
       }
       setShowAuthModal(false);
-      setEmail('');
-      setPassword('');
     } catch (err: any) {
-      console.error("Auth Exception:", err);
-      setAuthError(err.message.replace('Firebase: ', ''));
+      setAuthError((err.message || 'Error').replace('Firebase: ', '').toUpperCase());
     } finally {
       setIsSubmitting(false);
     }
   };
 
   const handleLogout = () => {
-    if (auth) signOut(auth);
+    if (isMockMode) {
+      setUser(null);
+      localStorage.removeItem('debt_sim_mock_user');
+    } else if (auth) {
+      signOut(auth);
+    }
   };
 
   // --- ENGINE CALCULATIONS ---
@@ -185,13 +226,8 @@ export default function App() {
     return debts.reduce((sum, d) => sum + Math.max(d.minPaymentFlat, d.balance * (d.minPaymentPercent / 100)), 0);
   }, [debts]);
 
-  // --- UI FORMATTERS ---
   const formatCurrency = (val: number) => 
-    new Intl.NumberFormat('en-US', { 
-      style: 'currency', 
-      currency: 'USD',
-      minimumFractionDigits: 2
-    }).format(val);
+    new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(val);
 
   const formatMonthLabel = (monthIndex: number) => {
     const date = new Date(startDate);
@@ -201,8 +237,7 @@ export default function App() {
 
   const toggleMonth = (m: number) => {
     const next = new Set(expandedMonths);
-    if (next.has(m)) next.delete(m);
-    else next.add(m);
+    if (next.has(m)) next.delete(m); else next.add(m);
     setExpandedMonths(next);
   };
 
@@ -211,36 +246,16 @@ export default function App() {
   };
 
   const addInjection = () => {
-    setInjections(prev => [...prev, { 
-      id: Math.random().toString(36).substr(2, 9), 
-      amount: 1000, 
-      date: new Date().toISOString().split('T')[0] 
-    }]);
+    setInjections(prev => [...prev, { id: Math.random().toString(36).substr(2, 9), amount: 1000, date: new Date().toISOString().split('T')[0] }]);
   };
 
-  const updateInjection = (id: string, field: keyof LumpSum, value: any) => {
-    setInjections(prev => prev.map(inj => inj.id === id ? { ...inj, [field]: value } : inj));
-  };
-
-  const removeInjection = (id: string) => {
-    setInjections(prev => prev.filter(inj => inj.id !== id));
-  };
+  const removeInjection = (id: string) => setInjections(prev => prev.filter(inj => inj.id !== id));
 
   const addBudgetChange = () => {
-    setBudgetChanges(prev => [...prev, {
-      id: Math.random().toString(36).substr(2, 9),
-      amount: monthlyBudget + 500,
-      date: new Date().toISOString().split('T')[0]
-    }]);
+    setBudgetChanges(prev => [...prev, { id: Math.random().toString(36).substr(2, 9), amount: monthlyBudget + 500, date: new Date().toISOString().split('T')[0] }]);
   };
 
-  const updateBudgetChange = (id: string, field: keyof BudgetChange, value: any) => {
-    setBudgetChanges(prev => prev.map(bc => bc.id === id ? { ...bc, [field]: value } : bc));
-  };
-
-  const removeBudgetChange = (id: string) => {
-    setBudgetChanges(prev => prev.filter(bc => bc.id !== id));
-  };
+  const removeBudgetChange = (id: string) => setBudgetChanges(prev => prev.filter(bc => bc.id !== id));
 
   const getMonthOffset = (dateStr: string) => {
     const now = new Date(startDate);
@@ -301,7 +316,7 @@ export default function App() {
                 </div>
               </div>
 
-              {authError && <p className="text-rose-500 text-[10px] font-bold uppercase text-center animate-pulse">{authError}</p>}
+              {authError && <p className="text-rose-500 text-[10px] font-bold uppercase text-center animate-pulse leading-relaxed px-4">{authError}</p>}
 
               <button 
                 type="submit" 
@@ -324,11 +339,7 @@ export default function App() {
               {isLoginView ? "Don't have an account? Sign Up" : "Already have an account? Sign In"}
             </button>
             
-            <button 
-              onClick={() => setShowAuthModal(false)}
-              disabled={isSubmitting}
-              className="absolute top-6 right-6 text-slate-600 hover:text-slate-300 transition-colors disabled:opacity-50"
-            >
+            <button onClick={() => setShowAuthModal(false)} className="absolute top-6 right-6 text-slate-600 hover:text-slate-300 transition-colors">
               <Trash2 className="w-5 h-5" />
             </button>
           </div>
@@ -345,7 +356,7 @@ export default function App() {
             {user ? (
               <div className="flex items-center gap-2 bg-emerald-500/10 border border-emerald-500/20 px-3 py-1 rounded-full text-[10px] font-black text-emerald-400">
                 <Cloud className={`w-3 h-3 ${isSyncing ? 'animate-pulse' : ''}`} /> 
-                {isSyncing ? 'SYNCING...' : 'CLOUD ACTIVE'}
+                {isSyncing ? 'SYNCING...' : isMockMode ? 'LOCAL CLOUD ACTIVE' : 'CLOUD ACTIVE'}
               </div>
             ) : (
               <div className="flex items-center gap-2 bg-slate-800 border border-slate-700 px-3 py-1 rounded-full text-[10px] font-black text-slate-500">
@@ -379,81 +390,34 @@ export default function App() {
       </header>
 
       <main className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-        {/* LEFT PANEL: INPUTS */}
         <div className="lg:col-span-4 space-y-6">
           <section className="bg-slate-900/50 border border-slate-800 rounded-3xl p-8 shadow-2xl backdrop-blur-sm">
-            <div className="flex justify-between items-center mb-6">
-              <h2 className="text-xl font-bold flex items-center gap-3">
-                <Settings2 className="w-5 h-5 text-emerald-500" /> Global Controls
-              </h2>
-            </div>
-            
+            <h2 className="text-xl font-bold flex items-center gap-3 mb-6">
+              <Settings2 className="w-5 h-5 text-emerald-500" /> Global Controls
+            </h2>
             <div className="space-y-6">
               <div className="group">
                 <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2 group-focus-within:text-emerald-400 transition-colors">Simulation Start</label>
                 <div className="relative">
                   <Calendar className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 w-4 h-4" />
-                  <input 
-                    type="date"
-                    value={startDate}
-                    onChange={(e) => setStartDate(e.target.value)}
-                    className="w-full bg-slate-800/50 border border-slate-700 rounded-2xl py-4 pl-12 pr-4 text-sm font-bold focus:ring-4 focus:ring-emerald-500/20 focus:border-emerald-500 outline-none transition-all [color-scheme:dark]"
-                  />
+                  <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="w-full bg-slate-800/50 border border-slate-700 rounded-2xl py-4 pl-12 pr-4 text-sm font-bold focus:ring-4 focus:ring-emerald-500/20 focus:border-emerald-500 outline-none transition-all [color-scheme:dark]" />
                 </div>
               </div>
-
               <div className="group">
                 <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2 group-focus-within:text-emerald-400 transition-colors">Monthly Budget</label>
                 <div className="relative">
                   <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 font-bold">$</span>
-                  <input 
-                    type="number"
-                    value={monthlyBudget}
-                    onChange={(e) => setMonthlyBudget(Number(e.target.value))}
-                    className="w-full bg-slate-800/50 border border-slate-700 rounded-2xl py-4 pl-10 pr-4 text-2xl font-black focus:ring-4 focus:ring-emerald-500/20 focus:border-emerald-500 outline-none transition-all"
-                  />
+                  <input type="number" value={monthlyBudget} onChange={(e) => setMonthlyBudget(Number(e.target.value))} className="w-full bg-slate-800/50 border border-slate-700 rounded-2xl py-4 pl-10 pr-4 text-2xl font-black focus:ring-4 focus:ring-emerald-500/20 focus:border-emerald-500 outline-none transition-all" />
                 </div>
               </div>
-
               <div className="pt-4 border-t border-slate-800">
-                <div className="flex justify-between items-center mb-4">
-                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest px-2">Budget Schedule</label>
-                   <button onClick={addBudgetChange} className="p-1.5 bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500 hover:text-white rounded-xl transition-all border border-cyan-500/20"><Plus className="w-4 h-4" /></button>
-                </div>
-                <div className="space-y-3">
-                  {budgetChanges.map((bc) => (
-                    <div key={bc.id} className="bg-slate-800/30 border border-slate-700/50 p-4 rounded-2xl group relative">
-                      <button onClick={() => removeBudgetChange(bc.id)} className="absolute -top-2 -right-2 p-1.5 bg-slate-900 border border-slate-700 rounded-full text-slate-600 hover:text-rose-500 transition-all opacity-0 group-hover:opacity-100 shadow-xl"><Trash2 className="w-3.5 h-3.5" /></button>
-                      <div className="flex items-center gap-3 mb-2">
-                        <Calendar className="w-4 h-4 text-slate-500" />
-                        <input type="date" value={bc.date} onChange={(e) => updateBudgetChange(bc.id, 'date', e.target.value)} className="bg-transparent text-xs font-bold text-slate-200 outline-none [color-scheme:dark]" />
-                      </div>
-                      <div className="relative">
-                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 font-bold text-xs">$</span>
-                        <input type="number" value={bc.amount} onChange={(e) => updateBudgetChange(bc.id, 'amount', Number(e.target.value))} className="w-full bg-slate-900/50 border border-slate-700 rounded-xl py-2 pl-7 pr-3 text-lg font-black focus:border-cyan-500 outline-none transition-all" />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div className="pt-4 border-t border-slate-800">
-                <div className="flex justify-between items-center mb-4">
-                   <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest px-2">Lump Injections</label>
-                   <button onClick={addInjection} className="p-1.5 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500 hover:text-white rounded-xl transition-all border border-cyan-500/20"><Plus className="w-4 h-4" /></button>
-                </div>
+                <div className="flex justify-between items-center mb-4"><label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest px-2">Lump Injections</label><button onClick={addInjection} className="p-1.5 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500 hover:text-white rounded-xl transition-all border border-cyan-500/20"><Plus className="w-4 h-4" /></button></div>
                 <div className="space-y-3">
                   {injections.map((inj) => (
                     <div key={inj.id} className="bg-slate-800/30 border border-slate-700/50 p-4 rounded-2xl group relative">
                       <button onClick={() => removeInjection(inj.id)} className="absolute -top-2 -right-2 p-1.5 bg-slate-900 border border-slate-700 rounded-full text-slate-600 hover:text-rose-500 transition-all opacity-0 group-hover:opacity-100 shadow-xl"><Trash2 className="w-3.5 h-3.5" /></button>
-                      <div className="flex items-center gap-3 mb-2">
-                        <Calendar className="w-4 h-4 text-slate-500" />
-                        <input type="date" value={inj.date} onChange={(e) => updateInjection(inj.id, 'date', e.target.value)} className="bg-transparent text-xs font-bold text-slate-200 outline-none [color-scheme:dark]" />
-                      </div>
-                      <div className="relative">
-                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 font-bold text-xs">$</span>
-                        <input type="number" value={inj.amount} onChange={(e) => updateInjection(inj.id, 'amount', Number(e.target.value))} className="w-full bg-slate-900/50 border border-slate-700 rounded-xl py-2 pl-7 pr-3 text-lg font-black focus:border-emerald-500 outline-none transition-all" />
-                      </div>
+                      <div className="flex items-center gap-3 mb-2"><Calendar className="w-4 h-4 text-slate-500" /><input type="date" value={inj.date} onChange={(e) => setInjections(prev => prev.map(i => i.id === inj.id ? { ...i, date: e.target.value } : i))} className="bg-transparent text-xs font-bold text-slate-200 outline-none [color-scheme:dark]" /></div>
+                      <div className="relative"><span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 font-bold text-xs">$</span><input type="number" value={inj.amount} onChange={(e) => setInjections(prev => prev.map(i => i.id === inj.id ? { ...i, amount: Number(e.target.value) } : i))} className="w-full bg-slate-900/50 border border-slate-700 rounded-xl py-2 pl-7 pr-3 text-lg font-black focus:border-emerald-500 outline-none transition-all" /></div>
                     </div>
                   ))}
                 </div>
@@ -481,20 +445,10 @@ export default function App() {
                     <tr key={debt.id} className="group hover:bg-slate-800/30 transition-colors">
                       <td className="py-3 text-[11px] font-bold text-slate-400">{debt.name}</td>
                       <td className="py-3 text-right">
-                        <input 
-                          type="number"
-                          value={debt.balance}
-                          onChange={(e) => handleDebtChange(debt.id, 'balance', Number(e.target.value))}
-                          className="bg-transparent text-right w-20 text-[11px] font-black outline-none focus:text-emerald-400"
-                        />
+                        <input type="number" value={debt.balance} onChange={(e) => handleDebtChange(debt.id, 'balance', Number(e.target.value))} className="bg-transparent text-right w-20 text-[11px] font-black outline-none focus:text-emerald-400" />
                       </td>
                       <td className="py-3 text-right">
-                        <input 
-                          type="number"
-                          value={debt.apr}
-                          onChange={(e) => handleDebtChange(debt.id, 'apr', Number(e.target.value))}
-                          className="bg-transparent text-right w-12 text-[11px] font-black text-cyan-400 outline-none focus:text-cyan-300"
-                        />
+                        <input type="number" value={debt.apr} onChange={(e) => handleDebtChange(debt.id, 'apr', Number(e.target.value))} className="bg-transparent text-right w-12 text-[11px] font-black text-cyan-400 outline-none focus:text-cyan-300" />
                       </td>
                     </tr>
                   ))}
@@ -504,23 +458,17 @@ export default function App() {
           </section>
         </div>
 
-        {/* RIGHT PANEL: DASHBOARD & LEDGER */}
         <div className="lg:col-span-8 space-y-8">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl shadow-xl relative overflow-hidden group">
-              <div className="absolute inset-0 bg-rose-500/5 opacity-0 group-hover:opacity-100 transition-opacity" />
               <p className="text-[9px] text-slate-500 uppercase font-black tracking-widest">Lifetime Interest</p>
               <h3 className="text-2xl font-black text-rose-500 mt-1">{formatCurrency(results.standard.totalInterestPaid)}</h3>
             </div>
-            
             <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl shadow-xl relative overflow-hidden group">
-              <div className="absolute inset-0 bg-cyan-500/5 opacity-0 group-hover:opacity-100 transition-opacity" />
               <p className="text-[9px] text-slate-500 uppercase font-black tracking-widest">Time to Freedom</p>
               <h3 className="text-2xl font-black text-cyan-400 mt-1">{results.standard.monthsToDebtFree} Months</h3>
             </div>
-
             <div className="bg-slate-900 border border-slate-800 p-6 rounded-3xl shadow-xl relative overflow-hidden group">
-              <div className="absolute inset-0 bg-emerald-500/5 opacity-0 group-hover:opacity-100 transition-opacity" />
               <p className="text-[9px] text-slate-500 uppercase font-black tracking-widest">Monthly Minimums</p>
               <h3 className="text-2xl font-black text-emerald-400 mt-1">{formatCurrency(totalMinimums)}</h3>
             </div>
@@ -532,7 +480,6 @@ export default function App() {
                 <ListFilter className="w-6 h-6 text-emerald-400" /> Payoff Ledger
               </h2>
             </div>
-
             <div className="divide-y divide-slate-800/50 max-h-[850px] overflow-y-auto custom-scrollbar">
               {results.standard.ledger.map((entry) => {
                 const hasInj = injections.some(inj => getMonthOffset(inj.date) === entry.month);
@@ -546,10 +493,10 @@ export default function App() {
                         </div>
                         <div>
                           <div className="flex items-center gap-3">
-                             <span className="text-2xl font-black">{formatCurrency(entry.remainingTotalBalance)}</span>
-                             {hasInj && <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 text-[8px] font-black uppercase tracking-widest border border-emerald-500/30">Injection</span>}
+                            <span className="text-2xl font-black">{formatCurrency(entry.remainingTotalBalance)}</span>
+                            {hasInj && <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 text-[8px] font-black uppercase tracking-widest border border-emerald-500/30">Injection</span>}
                           </div>
-                          <div className="text-[10px] flex gap-4 mt-1 font-bold">
+                          <div className="text-[10px] flex gap-4 mt-1 font-bold text-slate-500">
                             <span className="text-emerald-400/80 flex items-center gap-1.5 uppercase tracking-wide"><MoveUpRight className="w-3 h-3" /> Principal: {formatCurrency(entry.totalPrincipal)}</span>
                             <span className="text-rose-400/80 flex items-center gap-1.5 uppercase tracking-wide"><TrendingDown className="w-3 h-3" /> Interest: {formatCurrency(entry.totalInterest)}</span>
                           </div>
@@ -557,45 +504,26 @@ export default function App() {
                       </div>
                       {expandedMonths.has(entry.month) ? <ChevronDown className="w-5 h-5 text-slate-700" /> : <ChevronRight className="w-5 h-5 text-slate-700" />}
                     </button>
-
                     {expandedMonths.has(entry.month) && (
                       <div className="px-12 pb-8 pt-2 animate-in slide-in-from-top-4 duration-300">
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-8 bg-slate-950/50 p-6 rounded-[2rem] border border-slate-800">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-8 bg-slate-950/50 p-6 rounded-[2rem] border border-slate-800 text-xs">
                           <div className="space-y-4">
-                            <p className="text-[10px] uppercase font-black text-slate-500 tracking-widest">Transactions</p>
-                            <table className="w-full text-left text-[11px]">
-                              <thead>
-                                <tr className="text-slate-600 border-b border-slate-900">
-                                  <th className="pb-2">Debt</th>
-                                  <th className="pb-2 text-right">Prin</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {entry.payments.map((p, idx) => (
-                                  <tr key={idx} className="border-b border-slate-900/50">
-                                    <td className="py-2 font-bold text-slate-400">{p.debtName}</td>
-                                    <td className="py-2 text-right text-emerald-400 font-black font-mono">{formatCurrency(p.principal)}</td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
+                            <p className="text-[10px] uppercase font-black text-slate-500 tracking-widest">Payments</p>
+                            {entry.payments.map((p, idx) => (
+                              <div key={idx} className="flex justify-between items-center border-b border-slate-900 pb-2">
+                                <span className="text-slate-400 font-bold">{p.debtName}</span>
+                                <span className="text-emerald-400 font-black">{formatCurrency(p.principal)}</span>
+                              </div>
+                            ))}
                           </div>
-
                           <div className="space-y-4">
-                             <p className="text-[10px] uppercase font-black text-slate-500 tracking-widest">Remaining Balances</p>
-                             <div className="space-y-2">
-                               {Object.entries(entry.balances).map(([name, bal], idx) => {
-                                 const balanceValue = bal as number;
-                                 return (
-                                   <div key={idx} className="flex justify-between items-center text-xs">
-                                     <span className="font-semibold text-slate-400">{name}</span>
-                                     <span className={`font-mono font-black ${balanceValue <= 0 ? 'text-emerald-500 text-[10px] uppercase tracking-widest bg-emerald-500/10 px-2 py-0.5 rounded' : 'text-slate-300'}`}>
-                                        {balanceValue <= 0 ? 'PAID' : formatCurrency(balanceValue)}
-                                     </span>
-                                   </div>
-                                 );
-                               })}
-                             </div>
+                            <p className="text-[10px] uppercase font-black text-slate-500 tracking-widest">Balances</p>
+                            {Object.entries(entry.balances).map(([name, bal], idx) => (
+                              <div key={idx} className="flex justify-between items-center text-[11px]">
+                                <span className="text-slate-400">{name}</span>
+                                <span className={`font-black ${bal <= 0 ? 'text-emerald-500' : 'text-slate-300'}`}>{bal <= 0 ? 'PAID' : formatCurrency(bal)}</span>
+                              </div>
+                            ))}
                           </div>
                         </div>
                       </div>
@@ -609,7 +537,7 @@ export default function App() {
       </main>
       
       <footer className="max-w-7xl mx-auto mt-20 pt-10 border-t border-slate-900 text-center text-slate-600 text-[9px] font-black uppercase tracking-[0.5em]">
-        High-Fidelity Amortization Engine • Zero-Knowledge Firebase Architecture
+        High-Fidelity Amortization Engine • Zero-Knowledge Architecture
       </footer>
     </div>
   );
