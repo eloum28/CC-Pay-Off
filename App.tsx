@@ -21,7 +21,8 @@ import {
   UserPlus, 
   Mail, 
   Lock, 
-  Loader2 
+  Loader2,
+  CheckCircle2
 } from 'lucide-react';
 
 // Firebase Modular SDK (v10+)
@@ -93,6 +94,7 @@ export default function App() {
   // Auth & Sync State
   const [user, setUser] = useState<User | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [showSavedFeedback, setShowSavedFeedback] = useState(false);
   const [authLoading, setAuthLoading] = useState(true);
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [isLoginView, setIsLoginView] = useState(true);
@@ -102,7 +104,42 @@ export default function App() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isMockMode, setIsMockMode] = useState(false);
 
-  // --- PERSISTENCE: LOAD DATA ---
+  // --- SAVE TO FIRESTORE FUNCTION ---
+  const saveToFirestore = async () => {
+    if (!user) return;
+    setIsSyncing(true);
+    
+    const dataToSave = {
+      debts, 
+      startDate, 
+      injections, 
+      monthlyBudget, 
+      budgetChanges,
+      email: user.email,
+      lastModified: new Date().toISOString()
+    };
+
+    try {
+      if (isMockMode) {
+        localStorage.setItem(`debt_sim_data_${user.uid}`, JSON.stringify(dataToSave));
+        // Simulate network delay
+        await new Promise(resolve => setTimeout(resolve, 600));
+      } else if (db) {
+        const docRef = doc(db, 'users', user.uid, 'data', 'currentSimulation');
+        await setDoc(docRef, dataToSave, { merge: true });
+      }
+      
+      // Success Feedback
+      setShowSavedFeedback(true);
+      setTimeout(() => setShowSavedFeedback(false), 3000);
+    } catch (e) {
+      console.error("Firestore Save Error:", e);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  // --- PERSISTENCE: LOAD DATA ON LOGIN ---
   useEffect(() => {
     const { auth: currentAuth, db: currentDb, isMock } = initFirebase();
     setIsMockMode(isMock);
@@ -131,7 +168,9 @@ export default function App() {
       setAuthLoading(false);
       if (u && currentDb) {
         try {
-          const docSnap = await getDoc(doc(currentDb, 'users', u.uid));
+          // AUTO-LOAD ON LOGIN
+          const docRef = doc(currentDb, 'users', u.uid, 'data', 'currentSimulation');
+          const docSnap = await getDoc(docRef);
           if (docSnap.exists()) {
             const data = docSnap.data();
             if (data.debts) setDebts(data.debts);
@@ -140,34 +179,18 @@ export default function App() {
             if (data.monthlyBudget) setMonthlyBudget(data.monthlyBudget);
             if (data.budgetChanges) setBudgetChanges(data.budgetChanges);
           }
-        } catch (e) {}
+        } catch (e) {
+          console.error("Auto-load failed:", e);
+        }
       }
     });
     return () => unsubscribe();
   }, []);
 
-  // --- PERSISTENCE: SAVE DATA ---
+  // --- AUTO-SAVE (Optional Debounce) ---
   useEffect(() => {
     if (!user) return;
-
-    const saveTimeout = setTimeout(async () => {
-      setIsSyncing(true);
-      const dataToSave = {
-        debts, startDate, injections, monthlyBudget, budgetChanges,
-        email: user.email,
-        lastModified: new Date().toISOString()
-      };
-
-      if (isMockMode) {
-        localStorage.setItem(`debt_sim_data_${user.uid}`, JSON.stringify(dataToSave));
-        setTimeout(() => setIsSyncing(false), 500);
-      } else if (db) {
-        try {
-          await setDoc(doc(db, 'users', user.uid), dataToSave, { merge: true });
-        } catch (e) {} finally { setIsSyncing(false); }
-      }
-    }, 1000);
-
+    const saveTimeout = setTimeout(saveToFirestore, 2000);
     return () => clearTimeout(saveTimeout);
   }, [debts, startDate, injections, monthlyBudget, budgetChanges, user, isMockMode]);
 
@@ -354,9 +377,16 @@ export default function App() {
           <div className="flex items-center gap-4 mt-2">
             <p className="text-slate-400 font-medium tracking-wide uppercase text-xs">High-Fidelity Avalanche Engine</p>
             {user ? (
-              <div className="flex items-center gap-2 bg-emerald-500/10 border border-emerald-500/20 px-3 py-1 rounded-full text-[10px] font-black text-emerald-400">
-                <Cloud className={`w-3 h-3 ${isSyncing ? 'animate-pulse' : ''}`} /> 
-                {isSyncing ? 'SYNCING...' : isMockMode ? 'LOCAL CLOUD ACTIVE' : 'CLOUD ACTIVE'}
+              <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black transition-all border ${
+                showSavedFeedback 
+                ? 'bg-emerald-500 text-emerald-950 border-emerald-400 scale-105' 
+                : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+              }`}>
+                {showSavedFeedback ? (
+                  <><CheckCircle2 className="w-3 h-3" /> SAVED!</>
+                ) : (
+                  <><Cloud className={`w-3 h-3 ${isSyncing ? 'animate-pulse' : ''}`} /> {isSyncing ? 'SYNCING...' : isMockMode ? 'LOCAL CLOUD ACTIVE' : 'CLOUD ACTIVE'}</>
+                )}
               </div>
             ) : (
               <div className="flex items-center gap-2 bg-slate-800 border border-slate-700 px-3 py-1 rounded-full text-[10px] font-black text-slate-500">
@@ -392,9 +422,20 @@ export default function App() {
       <main className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
         <div className="lg:col-span-4 space-y-6">
           <section className="bg-slate-900/50 border border-slate-800 rounded-3xl p-8 shadow-2xl backdrop-blur-sm">
-            <h2 className="text-xl font-bold flex items-center gap-3 mb-6">
-              <Settings2 className="w-5 h-5 text-emerald-500" /> Global Controls
-            </h2>
+            <div className="flex justify-between items-center mb-6">
+              <h2 className="text-xl font-bold flex items-center gap-3">
+                <Settings2 className="w-5 h-5 text-emerald-500" /> Global Controls
+              </h2>
+              {user && (
+                <button 
+                  onClick={saveToFirestore}
+                  disabled={isSyncing}
+                  className="text-[10px] font-black uppercase px-3 py-1 bg-emerald-500/10 text-emerald-400 rounded-lg hover:bg-emerald-500 hover:text-emerald-950 transition-all border border-emerald-500/20 disabled:opacity-50"
+                >
+                  {isSyncing ? 'SAVING...' : 'SAVE NOW'}
+                </button>
+              )}
+            </div>
             <div className="space-y-6">
               <div className="group">
                 <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2 group-focus-within:text-emerald-400 transition-colors">Simulation Start</label>
